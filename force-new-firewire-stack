@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+# If you are running Linux kernel 2.6.32 or higher it is STRONGLY RECOMMENDED
+# that you run this script to force the old stack out and the new stack in.
+# The old stack has some serious flaws that flat out don't work in 2.6.32,
+# and in 2.6.35, allow "crosstalk" to happen between plugctl/plugreport
+# and dvminigrab i.e. if you run plugreport during dvminigrab's capture
+# the 61883 packets will end up getting into dvminigrab's input and
+# dvminigrab will complain about missing packets.
+#
+# Ick.
+#   --Jonathan C
+
+# out with the old
+rmmod ohci1394
+rmmod ieee1394
+rmmod raw1394
+rmmod sbp2
+
+# in with the new
+modprobe firewire-ohci
+modprobe firewire-sbp2
+modprobe firewire-net
+
