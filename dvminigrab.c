@@ -67,6 +67,11 @@
  * me to do is high-level connect-to-connect crap when I need to do LOW LEVEL STUFF! */
 #include "libiec61883-private.h"
 
+#define DV25_PACKET_SIZE 80
+#define MAX_DV_PACKETS_PER_FRAME 1801
+#define MAX_DV_PACKETS_NTSC 1500
+#define MAX_DV_PACKETS_PAL 1800
+
 volatile int global_death = 0;
 
 void sigma(int x) {
@@ -122,13 +127,11 @@ uint64_t		guid = 0;		/* GUID of device we're going for */
 int			unfiltered = 0;		/* Store DV data as-is, no filtering */
 int			bcast = 0;		/* capture using bcast method (or 0 = p2p method) */
 /* these too */
-int			capture_buffer_frame_size = 12000*10;
+int			capture_buffer_frame_size = MAX_DV_PACKETS_NTSC*DV25_PACKET_SIZE;
 volatile int		capture_buffer_i = 0,capture_buffer_o = 0;
 double*			capture_buffer_time = NULL;
 int			capture_buffer_size = 0;
 unsigned char*		capture_buffer = NULL;
-int			capture_buffer_is_shmem = 0;	/* 1=capture_buffer is actually shared memory segment in /dev/shm */
-const char*		capture_buffer_shmem = NULL;	/* non-null, use this /dev/shm path */
 
 volatile dv_capture_shmem_header*	capture_shmem_header = NULL;
 
@@ -137,8 +140,6 @@ static long long	DBC_packets_lost=0;
 
 const int		page_size = 4096;
 
-int			isp_header = 0;		/* at start of every capture, write ISP "marker" frame */
-int			holding_pattern = 0;	/* capture in "holding pattern" style */
 enum raw1394_iso_dma_recv_mode recv_mode = RAW1394_DMA_PACKET_PER_BUFFER;//RAW1394_DMA_DEFAULT;
 int			iso_active = 0;
 int			no_writing = 0;
@@ -162,11 +163,7 @@ void bell() {
 
 void free_capture_buffer() {
 	if (capture_buffer) {
-		if (capture_buffer_is_shmem)
-			munmap(capture_buffer,capture_buffer_frame_size * capture_buffer_size);
-		else
-			free(capture_buffer);
-
+		free(capture_buffer);
 		capture_buffer = NULL;
 	}
 
@@ -192,52 +189,7 @@ int init_capture_buffer(int sz,unsigned int frame_size) {
 	capture_buffer_i = capture_buffer_o = 0;
 	capture_buffer_size = sz;
 
-	if (capture_buffer_shmem) {
-		capture_buffer_is_shmem = 1;
-
-		int fd = open(capture_buffer_shmem,O_RDWR|O_CREAT|O_TRUNC,0644);
-		if (fd < 0) {
-			fprintf(stderr,"Error! Cannot open shared memory segment %s\n",capture_buffer_shmem);
-			return 1;
-		}
-
-		/* mapping layout:
-		 *    PAGE 0 = header + info + tracking
-		 *    PAGE 1...N = DV data */
-
-		if (ftruncate(fd,(capture_buffer_size * capture_buffer_frame_size)+page_size+65536) < 0) {
-			fprintf(stderr,"Cannot ftruncate out the shared memory segment\n");
-			return 1;
-		}
-
-		capture_shmem_header = (dv_capture_shmem_header*)
-			mmap(NULL,page_size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-
-		capture_buffer = (unsigned char*)mmap(NULL,(capture_buffer_size*capture_buffer_frame_size)+65536,PROT_READ|PROT_WRITE,MAP_SHARED,fd,page_size);
-		if (capture_buffer == (unsigned char*)(-1)) {
-			capture_buffer = NULL;
-			fprintf(stderr,"Cannot mmap, %s\n",strerror(errno));
-		}
-
-		close(fd);	/* the memory mapping persists even after closing the file */
-		printf("Buffering with shared memory segment %s\n",capture_buffer_shmem);
-
-		memcpy((char*)capture_shmem_header->sig,"DV25",4);
-		capture_shmem_header->version = DVMINIGRAB_STRUCT_VERSION;
-		capture_shmem_header->frame_size = capture_buffer_frame_size;
-		capture_shmem_header->frames = capture_buffer_size;
-		capture_shmem_header->output = capture_buffer_o;
-
-		/* and write a note of it too */
-		fd = open("shmem",O_WRONLY|O_CREAT|O_TRUNC,0644);
-		write(fd,capture_buffer_shmem,strlen(capture_buffer_shmem));
-		close(fd);
-	}
-	else {
-		capture_buffer_is_shmem = 0;
-		capture_buffer = malloc(capture_buffer_size * capture_buffer_frame_size);
-	}
-
+	capture_buffer = malloc(capture_buffer_size * capture_buffer_frame_size);
 	if (!capture_buffer)
 		return 1;
 
@@ -277,29 +229,12 @@ DIFchunk *PickDIF(unsigned char *raw)
 	return d;
 }
 
-void modify_header_enable_audio(unsigned char *frame,int sz) {
-	unsigned char *fence = frame + sz;
-
-	/* modify the header DIF to enable audio.
-	 * or else QuickTime will not play the audio despite it being there in the stream */
-	for (;frame < fence;frame += 150*80) {
-		DIFchunk *hdr = PickDIF(frame);
-		if (hdr->SCT == 0) {
-			unsigned char *H = hdr->raw;
-			H[4] = 0x78;
-			H[5] = 0x78;
-			H[6] = 0x78;
-			H[7] = 0x78;
-		}
-	}
-}
-
 int dv_read_aspect_ratio(unsigned char *frame) {
 	unsigned char *DV = frame;
 	unsigned char *fence = DV + capture_buffer_frame_size;
 	int ar = -1;
 
-	for (;DV < fence && ar < 0;DV += 80) {
+	for (;DV < fence && ar < 0;DV += DV25_PACKET_SIZE) {
 		DIFchunk *c = PickDIF(DV);
 		if (c->SCT == 2) {
 			unsigned char *B = c->raw+3;
@@ -350,9 +285,9 @@ int open_capture() {
 	if (capture_fd >= 0)
 		return 1;
 
-	char name[257];
-	if (holding_pattern)
-		snprintf(name,sizeof(name),"dvcap-%08lu-%s.holding.dv",time(NULL),capture_prefix);
+	char name[192];
+	if (unfiltered)
+		snprintf(name,sizeof(name),"dvcap-%08lu-%s.unfiltered.dv",time(NULL),capture_prefix);
 	else
 		snprintf(name,sizeof(name),"dvcap-%08lu-%s.dv",time(NULL),capture_prefix);
 
@@ -370,7 +305,7 @@ int open_capture() {
 	wav_fd = -1;
 
 	char wavname[257];
-	if (!holding_pattern) {
+	{
 		snprintf(wavname,sizeof(wavname),"%s.wav",name);
 		if ((wav_fd = open(wavname,O_RDWR|O_CREAT,0644)) < 0)
 			fprintf(stderr,"Cannot open %s (WAV)\n",wavname);
@@ -394,7 +329,6 @@ int open_capture() {
 	printf("   DV=%s\n",name);
 	if (wav_fd >= 0) printf("   WAV=%s\n",wavname);
 	if (log_fd >= 0) printf("   LOG=%s\n",logname);
-	printf("   hold=%d\n",holding_pattern);
 	printf("   firewire_recv_mode=%s\n",bcast ? "broadcast" : "p2p");
 
 	log_fd_next = -1;
@@ -419,22 +353,6 @@ int open_capture() {
 	}
 
 	return 0;
-}
-
-void mode_capture() {
-	if (holding_pattern) {
-		holding_pattern=0;
-		close_capture();
-		open_capture();
-	}
-}
-
-void mode_hold() {
-	if (!holding_pattern) {
-		holding_pattern=1;
-		close_capture();
-		open_capture();
-	}
 }
 
 static inline uint16_t bsw16(uint16_t v) {
@@ -475,7 +393,7 @@ int dv_decode_audio(unsigned char *frame,int len,int16_t *audio) {
 	for (i=0;i < 10;i++) {
 		for (j=0;j < 9;j++) {
 			bn = (i * 150) + (j << 4) + 6;
-			blk = frame + (bn * 80);
+			blk = frame + (bn * DV25_PACKET_SIZE);
 
 			if ((blk[0] >> 5) == 3 && blk[3] == 0x50) {
 				unsigned char *data = blk+3;
@@ -510,8 +428,8 @@ int dv_decode_audio(unsigned char *frame,int len,int16_t *audio) {
 			bn1 = (ds1 * 150) + (da << 4) + 6;
 			bn2 = (ds2 * 150) + (da << 4) + 6;
 
-			if (frame[bn1 * 80] != 0xFF) {
-				ptr = (signed short*)(frame + (bn1 * 80) + 8 + b);
+			if (frame[bn1 * DV25_PACKET_SIZE] != 0xFF) {
+				ptr = (signed short*)(frame + (bn1 * DV25_PACKET_SIZE) + 8 + b);
 #if BYTE_ORDER == BIG_ENDIAN
 				audec[N<<1] = *ptr;
 #else
@@ -519,8 +437,8 @@ int dv_decode_audio(unsigned char *frame,int len,int16_t *audio) {
 #endif
 			}
 
-			if (frame[bn2 * 80] != 0xFF) {
-				ptr = (signed short*)(frame + (bn2 * 80) + 8 + b);
+			if (frame[bn2 * DV25_PACKET_SIZE] != 0xFF) {
+				ptr = (signed short*)(frame + (bn2 * DV25_PACKET_SIZE) + 8 + b);
 #if BYTE_ORDER == BIG_ENDIAN
 				audec[(N<<1)+1] = *ptr;
 #else
@@ -549,10 +467,10 @@ int dv_decode_audio(unsigned char *frame,int len,int16_t *audio) {
 					int dsb = ds + (ch * 5);
 					int bn = (dsb * 150) + (dif << 4) + 6;
 
-					blk = frame + (bn * 80);
+					blk = frame + (bn * DV25_PACKET_SIZE);
 					if (*blk == 0xFF) continue;
 					i_base = dv_audio_unshuffle_60[ds][dif];
-					for (bp=8;bp < 80;bp += 3) {
+					for (bp=8;bp < DV25_PACKET_SIZE;bp += 3) {
 						i = i_base + (bp - 8)/3 * stride;
 						my = blk[bp];
 						mz = blk[bp+1];
@@ -672,62 +590,7 @@ int empty_capture_buffer(int max) {
 		}
 
 again:
-		/* ISP marker frame. at offset == 0 (begin of file) we write a "marker" frame.
-		 * as well as providing visual evidence this is ISP property, we also embed into this
-		 * frame proprietary data */
-		if (start == 0) {
-			int is_16x9 = known_aspect_ratio = dv_read_aspect_ratio(frame);
-
-			if (isp_header && !holding_pattern) {
-				printf("Writing ISP marker frame (%s)\n",is_16x9 == -1 ? "?" : (is_16x9 == 2 ? "16:9" : "4:3"));
-
-				/* take the appropriate raw frame, and stick it into the output file */
-				const char *raw_dv = "/usr/share/ispcolor4x3.dv";
-				if (is_16x9 == 1) raw_dv = "/usr/share/ispcolor16x9.dv";
-				printf("  using file: %s\n",raw_dv);
-
-				int rfd = open(raw_dv,O_RDONLY);
-				if (rfd < 0) {
-					printf("  ! cannot open, %s\n",strerror(errno));
-				}
-				else {
-					unsigned char *rframe = malloc(12000*10);
-					if (!rframe) {
-						printf("  ! not enough memory\n");
-					}
-					else {
-						int count=0,seq;
-
-						read(rfd,rframe,12000*10);
-						/* copy everything BUT video to the rframe */
-						for (count=0;count < 1500;count++) {
-							unsigned char *fraw = frame + (count * 80);
-							unsigned char *rraw = rframe + (count * 80);
-							DIFchunk *c = PickDIF(fraw);
-							if (c->SCT != 4 && fraw[0] != 0xFF) memcpy(rraw,fraw,80);
-
-						}
-						/* write out 10 frames */
-						for (count=0;count < 10;count++) {
-							for (seq=0;seq < 10;seq++) {
-								strcpy((char*)(rframe+20+(seq*12000)),"ISP marker frame");
-								rframe[77+(seq*12000)] = capture_file_sequence>>8;
-								rframe[78+(seq*12000)] = capture_file_sequence;
-								rframe[79+(seq*12000)] = 10-count;
-							}
-							write(capture_fd,rframe,12000*10);
-						}
-						/* update start pointer */
-						start += count * 12000*10;
-
-						free(rframe);
-
-					}
-					close(rfd);
-				}
-			}
-		}
-		else {
+		{
 			/* check for aspect ratio changes */
 			int is_16x9 = dv_read_aspect_ratio(frame);
 			if (is_16x9 >= 0 && is_16x9 != known_aspect_ratio) {
@@ -744,10 +607,6 @@ again:
 		int capi = capture_buffer_i;
 		int wrote_here = 0;
 		do {
-			/* also: strictly limit ourself if it would allow writing past the holding pattern limit */
-			if (holding_pattern && (start+length) >= holding_limit)
-				break;
-
 			wrote++;
 			wrote_here++;
 			length += capture_buffer_frame_size;
@@ -757,24 +616,6 @@ again:
 			}
 		} while (capture_buffer_i != capture_buffer_o && wrote < max);
 
-		/* must add "holding pattern" marking */
-		if (holding_pattern) {
-			unsigned char *p = frame;
-			unsigned char *f = frame + length;
-			for (;p < f;p += 12000*10) {
-				int seq;
-				for (seq=0;seq < 10;seq++) {
-					unsigned char *d = p + (seq*150*80);
-					strcpy((char*)(d+70),"hold");
-					d[75] = holding_counter>>8;
-					d[76] = holding_counter;
-					d[77] = capture_file_sequence>>8;
-					d[78] = capture_file_sequence;
-				}
-				holding_counter++;
-			}
-		}
-
 		if (write(capture_fd,frame,length) < length)
 			printf("Warning: write() could not write the entire block of data!\n");
 		long long endo = lseek64(capture_fd,0,SEEK_CUR);
@@ -783,9 +624,9 @@ again:
 
 		/* and log frame times */
 		{
-			int i,o,c=wrote_here;
+			int o,c=wrote_here;
 			char tmp[512];
-			for (i=capi,o=0;c-- > 0;capi++,o++) {
+			for (o=0;c-- > 0;capi++,o++) {
 				assert(capi < capture_buffer_size);
 
 				if (capture_buffer_time[capi] < 0)
@@ -918,14 +759,6 @@ again:
 			}
 		}
 
-		if (holding_pattern) {
-			if (endo >= holding_limit) { /* 1 min. holding pattern */
-				printf("Holding mode: rolling back around (%llu >= %llu)\n",endo,holding_limit);
-				lseek64(capture_fd,0,SEEK_SET);
-				capture_pos = 0;
-			}
-		}
-
 		if ((frame_count-announced_frame_count) >= 30) {
 			announced_frame_count = frame_count;
 			if (isatty(1)) printf("\x0D");
@@ -1013,11 +846,8 @@ static void help() {
 	fprintf(stderr," --channel <n>              Firewire channel to capture by (default=63)\n");
 	fprintf(stderr," --passive                  Don't reprogram PROM to change channel, passively listen\n");
 	fprintf(stderr," --unfiltered               Store incoming DV data as-is, no filtering\n");
-	fprintf(stderr," --isp-marker               At the start of every capture write ISP marker frame\n");
-	fprintf(stderr," --hold                     Start capture in 'holding pattern' mode\n");
 	fprintf(stderr," --prefix                   Preprend this prefix to the capture file name\n");
 	fprintf(stderr," --bcast                    Use broadcast capture (default)\n");
-	fprintf(stderr," --shmem <path>             Use shared memory segment for capture\n");
 	fprintf(stderr," --p2p                      Use peer-to-peer capture\n");
 	fprintf(stderr,"                             ! may not work in some combinations of computer and firewire host\n");
 	fprintf(stderr," --no-autosense             Do not try to auto-sense disconnect/reconnect of device\n");
@@ -1037,9 +867,6 @@ static int parse_args(int argc,char **argv) {
 				help();
 				return 1;
 			}
-			else if (!strcmp(a,"shmem")) {
-				capture_buffer_shmem = argv[i++];
-			}
 			else if (!strcmp(a,"guid")) {
 				guid = strtoull(argv[i++],NULL,16);
 			}
@@ -1054,12 +881,6 @@ static int parse_args(int argc,char **argv) {
 			}
 			else if (!strcmp(a,"unfiltered")) {
 				unfiltered = 1;
-			}
-			else if (!strcmp(a,"isp-marker")) {
-				isp_header = 1;
-			}
-			else if (!strcmp(a,"hold")) {
-				holding_pattern = 1;
 			}
 			else if (!strcmp(a,"prefix")) {
 				memset(capture_prefix,0,sizeof(capture_prefix));
@@ -1126,19 +947,20 @@ void store_output(unsigned char *data,size_t len) {
 	}
 }
 
-#define DV25_PACKET_SIZE 80
 /* filtered DV25 frame assembly and management */
-const int dv25_max_packet = 1801;
-char dv25_already[1801] = {0}; /* if we already have that packet */
-unsigned char dv25_assembly[12000*12]; /* enough even for the PAL version */
+char dv25_already[MAX_DV_PACKETS_PER_FRAME] = {0}; /* if we already have that packet */
+unsigned char dv25_assembly[MAX_DV_PACKETS_PER_FRAME*DV25_PACKET_SIZE]; /* enough even for the PAL version */
+unsigned int dv25_unfiltered_count = 0;
 /* TODO: code to handle PAL */
 
 void init_dv25_assembly() {
+	dv25_unfiltered_count = 0;
 	memset(dv25_already,0,sizeof(dv25_already));
 	memset(dv25_assembly,0xFF,sizeof(dv25_assembly));
 }
 
 void next_dv25_assembly() {
+	dv25_unfiltered_count = 0;
 	memset(dv25_already,0,sizeof(dv25_already));
 }
 
@@ -1148,12 +970,15 @@ void emit_assembled_dv25() {
 	 *                   in an ideal situation like all data coming through uncorrupted,
 	 *                   this would equate to zero memset() calls, yet allows partial
 	 *                   captures with missing blocks to be properly memset()'d to 0xFF */
-	for (i=0;i < (150*10);i++)
+	for (i=0;i < MAX_DV_PACKETS_PER_FRAME;i++)
 		if (!dv25_already[i])
-			memset(dv25_assembly+(i*80),0xFF,80);
+			memset(dv25_assembly+(i*DV25_PACKET_SIZE),0xFF,DV25_PACKET_SIZE);
 
 	/* quick sanity checks */
-	if (dv25_already[0]) {
+	if (unfiltered) {
+		assert(capture_buffer_frame_size == (MAX_DV_PACKETS_NTSC*DV25_PACKET_SIZE) || capture_buffer_frame_size == (MAX_DV_PACKETS_PAL*DV25_PACKET_SIZE));
+	}
+	else if (dv25_already[0]) {
 		/* header check and warning */
 		/* unused variables commented out to silence GCC */
 		unsigned char *H = dv25_assembly;	/* header DIF is block 0 */
@@ -1164,13 +989,13 @@ void emit_assembled_dv25() {
 //		unsigned char TF3 = H[7] >> 7;		/* subcode DIFs? */
 
 		/* make sure we're matching the TV standard */
-		if (capture_buffer_frame_size == (12000*10) && DSF)
+		if (capture_buffer_frame_size == (MAX_DV_PACKETS_NTSC*DV25_PACKET_SIZE) && DSF)
 			printf("Warning! Capturing NTSC style but header suggests PAL DV codec!\n");
-		else if (capture_buffer_frame_size == (12000*12) && !DSF)
+		else if (capture_buffer_frame_size == (MAX_DV_PACKETS_PAL*DV25_PACKET_SIZE) && !DSF)
 			printf("Warning! Capturing PAL style but header suggests NTSC DV codec!\n");
 	}
 
-	store_output(dv25_assembly,12000*10);
+	store_output(dv25_assembly,capture_buffer_frame_size);
 }
 
 int DIFNull(unsigned char *DV) {
@@ -1182,8 +1007,28 @@ int DIFNull(unsigned char *DV) {
 	return 0;
 }
 
+void dv25_unfiltered_complete_flush() {
+	if ((dv25_unfiltered_count*DV25_PACKET_SIZE) >= capture_buffer_frame_size) {
+		emit_assembled_dv25();
+		next_dv25_assembly();
+		dv25_unfiltered_count = 0;
+	}
+}
+
+void dv25_unfiltered(unsigned char *DV,int packets) {
+	for (;packets-- > 0;DV += DV25_PACKET_SIZE) {
+		dv25_unfiltered_complete_flush();
+		assert((dv25_unfiltered_count*DV25_PACKET_SIZE) < capture_buffer_frame_size);
+
+		memcpy(dv25_assembly+(dv25_unfiltered_count*DV25_PACKET_SIZE),DV,DV25_PACKET_SIZE);
+		dv25_already[dv25_unfiltered_count]++;
+		dv25_unfiltered_count++;
+	}
+
+	dv25_unfiltered_complete_flush();
+}
+
 void dv25_assemble(unsigned char *DV,int packets) {
-	static int packetcount = 0;
 	for (;packets-- > 0;DV += DV25_PACKET_SIZE) {
 		/* ignore null packets */
 		if (DIFNull(DV)) continue;
@@ -1221,12 +1066,10 @@ void dv25_assemble(unsigned char *DV,int packets) {
 			{
 
 				/* pack it in! */
-				memcpy(dv25_assembly + (b * 80),c->raw,80);
+				memcpy(dv25_assembly + (b * DV25_PACKET_SIZE),c->raw,DV25_PACKET_SIZE);
 				dv25_already[b]++;
 			}
 		}
-
-		packetcount++;
 	}
 }
 
@@ -1268,16 +1111,10 @@ static enum raw1394_iso_disposition iso_handler_dv25(raw1394handle_t handle, uns
 	}
 
 	/* work through the DV packets */
-	if (unfiltered) {
-		size_t sz = (size_t)fence - (size_t)DV;
-		sz -= sz % 80;
-		if (sz > 0) {
-			// TODO: buffered "assembly" into a DV25 frame even though we're not assembling it
-		}
-	}
-	else {
-		size_t sz = ((size_t)fence - (size_t)DV) / DV25_PACKET_SIZE;
-		if (sz > 0) dv25_assemble(DV,sz);
+	const size_t sz = ((size_t)fence - (size_t)DV) / DV25_PACKET_SIZE;
+	if (sz > 0) {
+		if (unfiltered) dv25_unfiltered(DV,sz);
+		else dv25_assemble(DV,sz);
 	}
 
 	last_DBC = DBC;
@@ -1325,14 +1162,14 @@ void set_channel() {
 		opcr.bcast_connection = 1;
 		opcr.n_p2p_connections = 0;
 		opcr.data_rate = 0;
-		opcr.payload = 488/4;
+		opcr.payload = 488/4; /* 488 bytes in 32-bit WORDS */
 	}
 	else {
 		opcr.bcast_connection = 0;
 		opcr.n_p2p_connections = 1;
 		opcr.channel = channel;
 		opcr.data_rate = 0;
-		opcr.payload = 488/4;
+		opcr.payload = 488/4; /* 488 bytes in 32-bit WORDS */
 	}
 
 	if (bcast) {
@@ -1369,7 +1206,8 @@ int start_iso_recv_dv25() {
 	last_start_iso = start_iso_recv_dv25;
 	if (iso_active) return 0;
 
-	if (raw1394_iso_recv_init(raw1394, iso_handler_dv25, (1500/6) * 3 * 30, 8+(80*6), channel, recv_mode, 64) < 0) { /* up to 3 seconds */
+	/* 80*6 = 480. Add 8 for header. 488 */
+	if (raw1394_iso_recv_init(raw1394, iso_handler_dv25, MAX_DV_PACKETS_PER_FRAME * 5, 8+(DV25_PACKET_SIZE*6), channel, recv_mode, 64) < 0) { /* up to 5 seconds PAL */
 		printf("iso_recv_init() failed\n");
 		return 1;
 	}
@@ -1403,87 +1241,6 @@ int stop_iso_recv() {
 	return 0;
 }
 
-#if 0
-static char stdin_cmd[1024];
-int stdin_cmdi=0;
-void handle_stdin() {
-	char c;
-
-	while (read(0,&c,1) == 1) {
-		if (c == '\n') {
-			stdin_cmd[stdin_cmdi] = 0;
-			stdin_cmdi = 0;
-
-			if (!strcmp(stdin_cmd,"hold")) {
-				start_iso_recv_dv25();
-				mode_hold();
-			}
-			else if (!strcmp(stdin_cmd,"rec")) {
-				start_iso_recv_dv25();
-				mode_capture();
-			}
-			else if (!strcmp(stdin_cmd,"stop")) {
-				stop_iso_recv();
-				mode_hold();
-			}
-			else if (!strcmp(stdin_cmd,"split")) {
-				close_capture();
-				open_capture();
-			}
-			else if (!strncmp(stdin_cmd,"prefix ",7)) {
-				char *p = stdin_cmd+7;
-				while (*p == ' ') p++;
-				char *n = strchr(p,' ');
-				if (n) *n++ = 0;
-				if (strlen(p) > 0 && strcmp(capture_prefix,p)) {
-					memset(capture_prefix,0,sizeof(capture_prefix));
-					strncpy(capture_prefix,p,sizeof(capture_prefix)-1);
-					close_capture();
-					open_capture();
-				}
-			}
-			else if (!strncmp(stdin_cmd,"redirect ",9)) {
-				char *p = stdin_cmd+9;
-				while (*p == ' ') p++;
-				char *n = strchr(p,' ');
-				if (n) *n++ = 0;
-				if (strlen(p) > 0) {
-					/* this is a path where to redirect */
-					printf("Moving to: %s\n",p);
-					if (chdir(p) == 0) {
-						/* now ... */
-						{
-							char cwd[256];
-							getcwd(cwd,sizeof(cwd));
-							printf("Now in: %s\n",cwd);
-
-							/* and clear the now capturing */
-							{
-								char tmp[512];
-								sprintf(tmp,"%s/now-capturing",cwd);
-								unlink(tmp);
-							}
-						}
-						/* take effect */
-						close_capture();
-						open_capture();
-					}
-					else {
-						printf(" ! Failed to move!\n");
-					}
-				}
-			}
-			else
-				printf("What does that mean?\n");
-		}
-		else {
-			if (stdin_cmdi < 1023)
-				stdin_cmd[stdin_cmdi++] = c;
-		}
-	}
-}
-#endif
-
 void check_low_disk_space() {
 	struct statfs fs;
 
@@ -1500,12 +1257,12 @@ void check_low_disk_space() {
 	 * assuring that in the event of low disk space, the admin has plenty of time to plug in a new drive
 	 * and redirect capture to that drive. */
 	if (left < (500LL*1024LL*1024LL)) {
-		if (capture_fd >= 0 && !holding_pattern) {
+		if (capture_fd >= 0) {
 			printf("Low disk space! Transitioning capture to holding pattern.\n");
 			printf("  You (the admin) have 1 minute to plug in another hard disk\n");
 			printf("  and redirect capture to that disk before you start to lose\n");
 			printf("  capture data.\n");
-			mode_hold();
+			global_death++;
 		}
 	}
 }
@@ -1514,8 +1271,8 @@ void *capture_thread_proc(void *arg) {
 	while (!capture_thread_die) {
 		int count,ret=0;
 
-		/* loop for exactly the number of packets it takes for one frame to complete */
-		for (count=0,ret=0;count < (1500/6) && ret == 0;count++) {
+		/* loop for exactly the number of packets it takes for one tenth of a frame to complete */
+		for (count=0,ret=0;count < (capture_buffer_frame_size/10) && ret == 0;count++) {
 			struct timeval tv;
 			tv.tv_usec = 100000;
 			tv.tv_sec = 0;
@@ -1568,8 +1325,6 @@ void stop_capture_thread() {
 }
 
 int main(int argc,char **argv) {
-	time_t next_flush=0,now_t=0;
-
 	if (parse_args(argc,argv))
 		return 1;
 
@@ -1592,7 +1347,7 @@ int main(int argc,char **argv) {
 
 	dv25_discard = 1;
 	init_dv25_assembly();
-	if (init_capture_buffer(30*4,12000*10)) { /* 4 second video buffer of NTSC DV */
+	if (init_capture_buffer(30*4,MAX_DV_PACKETS_NTSC*DV25_PACKET_SIZE)) { /* 4 second video buffer of NTSC DV */
 		fprintf(stderr,"Cannot init capture buffer\n");
 		return 1;
 	}
@@ -1633,11 +1388,6 @@ int main(int argc,char **argv) {
 
 	int ret = 0,wrote;
 	while (ret == 0 && !global_death) {
-		now_t = time(NULL);
-
-		/* only for testing */
-//		clocksync_master();
-
 		wrote = 0;
 		if (capture_mutex_lock()) {
 			/* write a maximum of 1/4th the buffer, so the capture thread may have a chance to fill another part */
@@ -1652,26 +1402,12 @@ int main(int argc,char **argv) {
 			/* check other conditions */
 			check_low_disk_space();
 
-#if 0
-			/* parent process/user commands entered at STDIN? */
-			handle_stdin();
-#endif
-
 			/* done. back to you, capture thread */
 			assert(capture_mutex_unlock());
 		}
 
 		/* wait */
 		if (wrote == 0) {
-#if 0
-			if (now_t >= next_flush) {
-				if ((next_flush += 2) < now_t)
-					next_flush = now_t + 2;
-
-				if (wav_fd >= 0)
-					fsync(wav_fd);
-			}
-#endif
 			usleep(1000000/30);
 		}
 	}
