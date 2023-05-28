@@ -590,7 +590,7 @@ int empty_capture_buffer(int max) {
 		}
 
 again:
-		{
+		if (!unfiltered) {
 			/* check for aspect ratio changes */
 			int is_16x9 = dv_read_aspect_ratio(frame);
 			if (is_16x9 >= 0 && is_16x9 != known_aspect_ratio) {
