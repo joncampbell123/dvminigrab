@@ -1,4 +1,4 @@
-all: dvminigrab dvminigrab50 dvminigrab100
+all: dvminigrab dvminigrab50 dvminigrab100 dvminigrab_mpeg_ts
 
 CFLAGS=@CFLAGS@ -Wall -pedantic -Wno-strict-aliasing -std=gnu99 -D__USE_LARGEFILE64 -D_FILE_OFFSET_BITS=64
 ROOT=$(DESTDIR)
@@ -7,6 +7,12 @@ bindir=$(prefix)/bin
 libdir=$(prefix)/lib
 sharedir=$(prefix)/share
 includedir=$(prefix)/include
+
+dvminigrab_mpeg_ts: dvminigrab_mpeg_ts.o
+	gcc -o $@ $< -lraw1394 -lavc1394 -lrom1394 -liec61883 -lpthread -lclocksync
+
+dvminigrab_mpeg_ts.o: dvminigrab_mpeg_ts.c
+	gcc $(CFLAGS) -c -o $@ $<
 
 dvminigrab100: dvminigrab100.o
 	gcc -o $@ $< -lraw1394 -lavc1394 -lrom1394 -liec61883 -lpthread -lclocksync
@@ -34,6 +40,7 @@ install:
 	cp -fv dvminigrab $(ROOT)$(bindir)/
 	cp -fv dvminigrab50 $(ROOT)$(bindir)/
 	cp -fv dvminigrab100 $(ROOT)$(bindir)/
+	cp -fv dvminigrab_mpeg_ts $(ROOT)$(bindir)/
 	cp -v plugctl-panasonic-force-channel-p2p $(ROOT)$(bindir)/
 	bunzip2 -c -d ispcolor4x3.dv.bz2 >$(ROOT)$(sharedir)/ispcolor4x3.dv
 	bunzip2 -c -d ispcolor16x9.dv.bz2 >$(ROOT)$(sharedir)/ispcolor16x9.dv
