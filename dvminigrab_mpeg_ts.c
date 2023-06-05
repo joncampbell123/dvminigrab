@@ -687,7 +687,7 @@ int start_iso_recv_dv25() {
 	if (iso_active) return 0;
 
 	/* 25000000/8/192 = 16276 packets */
-	if (raw1394_iso_recv_init(raw1394, iso_handler_dv25, 1628/*num packets*/, 8+(192*8)/*max size of packet normal 2-3*/, channel, recv_mode, 64) < 0) { /* up to 5 seconds */
+	if (raw1394_iso_recv_init(raw1394, iso_handler_dv25, 500/*num packets*/, 8+(192*8)/*max size of packet normal 2-3*/, channel, recv_mode, 64) < 0) { /* up to 5 seconds */
 		printf("iso_recv_init() failed\n");
 		return 1;
 	}
