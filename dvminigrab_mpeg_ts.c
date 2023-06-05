@@ -99,6 +99,10 @@ int capture_mutex_unlock() {
 	return (pthread_mutex_unlock(&capture_mutex) == 0);
 }
 
+/* HDV is MPEG-TS on a MiniDV tape at the same 25mbit/sec */
+#define FRAME_SIZE_PACKETS ((25000000UL/8UL/192UL))
+#define FRAME_SIZE_DIV (30UL)
+
 pthread_t		capture_thread = 0;
 volatile int		capture_thread_die = 0;
 
@@ -113,7 +117,7 @@ int			passive = 0;		/* 1=don't change channels, passively listen to broadcast */
 uint64_t		guid = 0;		/* GUID of device we're going for */
 int			bcast = 0;		/* capture using bcast method (or 0 = p2p method) */
 /* these too */
-int			capture_buffer_frame_size = 192*300;//guess
+int			capture_buffer_frame_size = 192*(FRAME_SIZE_PACKETS/FRAME_SIZE_DIV);//roughly 1/10th of a second of MPEG TS
 volatile int		capture_buffer_i = 0,capture_buffer_o = 0;
 double*			capture_buffer_time = NULL;
 int			capture_buffer_size = 0;
@@ -534,7 +538,7 @@ void store_output(unsigned char *data,size_t len) {
 	}
 }
 
-static unsigned char capframe[192*300];
+static unsigned char capframe[192*(FRAME_SIZE_PACKETS/FRAME_SIZE_DIV)];
 static unsigned int capframe_w = 0;
 
 static void dv_mts_unfiltered(unsigned char *data,unsigned int pkt) {
@@ -682,8 +686,8 @@ int start_iso_recv_dv25() {
 	last_start_iso = start_iso_recv_dv25;
 	if (iso_active) return 0;
 
-	/* 80*6 = 480. Add 8 for header. 488 */
-	if (raw1394_iso_recv_init(raw1394, iso_handler_dv25, 8+(192*300), 8+(192*6), channel, recv_mode, 64) < 0) { /* up to 5 seconds PAL */
+	/* 25000000/8/192 = 16276 packets */
+	if (raw1394_iso_recv_init(raw1394, iso_handler_dv25, 1628/*num packets*/, 8+(192*8)/*max size of packet normal 2-3*/, channel, recv_mode, 64) < 0) { /* up to 5 seconds */
 		printf("iso_recv_init() failed\n");
 		return 1;
 	}
@@ -821,7 +825,7 @@ int main(int argc,char **argv) {
 	signal(SIGQUIT,sigma);
 	signal(SIGTERM,sigma);
 
-	if (init_capture_buffer(400,192*300)) { /* 23MB */
+	if (init_capture_buffer(50,192*(FRAME_SIZE_PACKETS/FRAME_SIZE_DIV))) { /* 23MB */
 		fprintf(stderr,"Cannot init capture buffer\n");
 		return 1;
 	}
